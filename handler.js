@@ -13,10 +13,40 @@ import path from "path";
 import { format } from "util";
 import { unwatchFile, watchFile } from "fs";
 import chalk from "chalk";
-import { jidNormalizedUser } from "baileys";
+import { jidNormalizedUser, delay as baileysDelay } from "baileys";
 
 const isNumber = x => typeof x === "number" && !isNaN(x);
 const printMessages = (await import("./function/print.js")).default;
+
+// RATE LIMIT MANAGER
+class RateLimitManager {
+    constructor() {
+        this.lastRequest = {};
+        this.queue = new Map();
+        this.globalDelay = 1500; // Delay minimal antar request
+    }
+
+    async waitForTurn(jid, type = 'message') {
+        const key = `${jid}_${type}`;
+        const now = Date.now();
+        
+        if (this.lastRequest[key]) {
+            const timeSinceLast = now - this.lastRequest[key];
+            if (timeSinceLast < this.globalDelay) {
+                const waitTime = this.globalDelay - timeSinceLast;
+                await this.delay(waitTime + Math.random() * 500); // Tambah random delay
+            }
+        }
+        
+        this.lastRequest[key] = Date.now();
+    }
+
+    delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+}
+
+const rateLimitManager = new RateLimitManager();
 
 function getBotJid(conn) {
     if (!conn || !conn.user) return "";
@@ -25,53 +55,129 @@ function getBotJid(conn) {
     return "";
 }
 
-// AUTO RESET LIMIT HANYA UNTUK USER BIASA (PREMIUM DI-SKIP)
-function dailyLimitReset() {
-    if (!global.db?.data) return;
+// SISTEM LIMIT BARU - TANPA RESET HARIAN
+class LimitSystem {
+    constructor() {
+        this.dailyResetHour = 0; // Jam reset (00:00)
+    }
 
-    const now = new Date();
-    const wib = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Jakarta" }));
-    const today = wib.getDate();
-
-    if (!global.db.data.settings) global.db.data.settings = {};
-    if (global.db.data.settings.lastLimitReset === today) return;
-
-    console.log(chalk.cyanBright(`[AUTO RESET] Reset limit user biasa — ${wib.toLocaleDateString("id-ID")}`));
-
-    for (let jid in global.db.data.users) {
-        const user = global.db.data.users[jid];
-        if (!user) continue;
+    // Cek apakah user perlu reset limit
+    needsDailyReset(user) {
+        if (!user || !user.lastLimitUpdate) return true;
         
-        // HANYA RESET UNTUK USER BIASA, SKIP PREMIUM
-        const isPremiumActive = user.premium && user.premiumTime > Date.now();
-        if (!isPremiumActive && typeof user.limit === "number") {
-            // Reset ke 10 hanya jika limit bukan unlimited
-            if (user.limit !== Infinity && user.limit !== -1) {
-                user.limit = 10;
+        const now = new Date();
+        const lastUpdate = new Date(user.lastLimitUpdate);
+        
+        // Reset hanya jika sudah lewat hari baru (00:00 WIB)
+        return now.getDate() !== lastUpdate.getDate() && 
+               now.getHours() >= this.dailyResetHour;
+    }
+
+    // Update limit user
+    updateUserLimit(user, isPremium) {
+        if (!user) return;
+        
+        const now = new Date();
+        
+        if (this.needsDailyReset(user)) {
+            // HANYA user biasa yang direset, premium tetap unlimited
+            if (!isPremium && user.limit !== Infinity && user.limit !== -1) {
+                // Reset ke default (10) atau tetap dengan sisa sebelumnya
+                if (user.limit < 10) {
+                    user.limit = 10;
+                }
             }
+            user.lastLimitUpdate = now.toISOString();
         }
     }
 
-    global.db.data.settings.lastLimitReset = today;
-    global.db.saveDatabase?.();
+    // Kurangi limit untuk user biasa
+    useLimit(user, amount = 1) {
+        if (!user || user.limit === Infinity || user.limit === -1) {
+            return true; // Unlimited users always have limit
+        }
+        
+        if (user.limit >= amount) {
+            user.limit -= amount;
+            user.lastLimitUpdate = new Date().toISOString();
+            return true;
+        }
+        return false;
+    }
+
+    // Tambah limit (untuk owner/admin)
+    addLimit(user, amount = 1) {
+        if (!user) return;
+        if (user.limit === Infinity || user.limit === -1) return;
+        
+        user.limit += amount;
+        user.lastLimitUpdate = new Date().toISOString();
+    }
 }
 
-setInterval(dailyLimitReset, 60_000);
+const limitSystem = new LimitSystem();
 
-// FUNGSI DELAY UNTUK MENCEGAH RATE LIMIT
-async function delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+// DELAY FUNCTION YANG LEBIH AMAN
+async function safeDelay(ms) {
+    return new Promise(resolve => {
+        // Jangan delay lebih dari 10 detik
+        const safeMs = Math.min(ms, 10000);
+        setTimeout(resolve, safeMs);
+    });
 }
 
-// FUNGSI SEND MESSAGE DENGAN AUTO DELAY
-async function sendMessageWithDelay(conn, jid, content, options = {}, delayMs = 2000) {
+// SEND MESSAGE DENGAN RATE LIMIT PROTECTION
+async function sendMessageWithProtection(conn, jid, content, options = {}, type = 'message') {
     try {
+        // Tunggu giliran untuk mencegah rate limit
+        await rateLimitManager.waitForTurn(jid, type);
+        
+        // Tambah delay random untuk distribusi request
+        await safeDelay(500 + Math.random() * 1000);
+        
         const result = await conn.sendMessage(jid, content, options);
-        await delay(delayMs); // Delay antar pesan
+        
+        // Delay setelah kirim pesan
+        await safeDelay(1000);
+        
         return result;
     } catch (error) {
         console.error('[SEND MESSAGE ERROR]', error);
+        
+        // Jika error rate limit, tunggu lebih lama
+        if (error.message?.includes('rate-overlimit') || error.message?.includes('429')) {
+            console.log('[RATE LIMIT DETECTED] Waiting 30 seconds...');
+            await safeDelay(30000); // Tunggu 30 detik
+        }
         throw error;
+    }
+}
+
+// GROUP METADATA DENGAN CACHE DAN PROTECTION
+async function getGroupMetadataWithCache(conn, chatId) {
+    try {
+        // Cek cache dulu
+        if (conn.chats?.[chatId]?.metadata) {
+            return conn.chats[chatId].metadata;
+        }
+        
+        // Delay sebelum fetch metadata
+        await safeDelay(1000 + Math.random() * 2000);
+        
+        // Gunakan rate limit protection
+        await rateLimitManager.waitForTurn(chatId, 'metadata');
+        
+        const metadata = await conn.groupMetadata(chatId).catch(() => ({}));
+        
+        // Simpan ke cache
+        if (!conn.chats) conn.chats = {};
+        if (!conn.chats[chatId]) conn.chats[chatId] = {};
+        conn.chats[chatId].metadata = metadata;
+        
+        return metadata;
+    } catch (error) {
+        console.error('[GROUP METADATA ERROR]', error);
+        return {};
     }
 }
 
@@ -81,8 +187,6 @@ export async function handler(chatUpdate) {
     this.pushMessage?.(chatUpdate.messages).catch(console.error);
     let m = chatUpdate.messages[chatUpdate.messages.length - 1];
     if (!m) return;
-
-    dailyLimitReset();
 
     try {
         m = (await smsg(this, m)) || m;
@@ -113,15 +217,15 @@ export async function handler(chatUpdate) {
                 if (!isNumber(user.level)) user.level = 0;
                 if (!isNumber(user.exp)) user.exp = 0;
                 
-                // INISIALISASI LIMIT - HANYA JIKA BELUM ADA ATAU BUKAN PREMIUM
+                // INISIALISASI DAN UPDATE LIMIT DENGAN SISTEM BARU
                 const isPremiumActive = user.premium && user.premiumTime > Date.now();
+                
                 if (!isNumber(user.limit)) {
-                    user.limit = isPremiumActive ? Infinity : 10; // Premium unlimited, biasa 10
-                } else if (isPremiumActive && user.limit !== Infinity) {
-                    user.limit = Infinity; // Upgrade ke premium -> unlimited
-                } else if (!isPremiumActive && (user.limit === Infinity || user.limit === -1)) {
-                    user.limit = 10; // Downgrade dari premium -> reset ke 10
+                    user.limit = isPremiumActive ? Infinity : 10;
                 }
+                
+                // Update limit berdasarkan sistem baru
+                limitSystem.updateUserLimit(user, isPremiumActive);
                 
                 if (!("afk" in user)) user.afk = false;
                 if (!("afkReason" in user)) user.afkReason = "";
@@ -133,16 +237,33 @@ export async function handler(chatUpdate) {
                 if (!isNumber(user.premiumTime)) user.premiumTime = 0;
                 if (!isNumber(user.premiumDate)) user.premiumDate = -1;
                 if (!isNumber(user.bannedDate)) user.bannedDate = -1;
+                
+                // Tambah field baru untuk tracking
+                if (!("lastLimitUpdate" in user)) {
+                    user.lastLimitUpdate = new Date().toISOString();
+                }
             } else {
                 global.db.data.users[m.sender] = {
-                    name: m.name || "User", age: -1, level: 0, exp: 0, 
+                    name: m.name || "User", 
+                    age: -1, 
+                    level: 0, 
+                    exp: 0, 
                     limit: 10, // Default untuk user baru
-                    afk: false, afkReason: "", register: false, premium: false, banned: false,
-                    afkTime: -1, regTime: -1, premiumTime: 0, premiumDate: -1, bannedDate: -1
+                    afk: false, 
+                    afkReason: "", 
+                    register: false, 
+                    premium: false, 
+                    banned: false,
+                    afkTime: -1, 
+                    regTime: -1, 
+                    premiumTime: 0, 
+                    premiumDate: -1, 
+                    bannedDate: -1,
+                    lastLimitUpdate: new Date().toISOString()
                 };
             }
 
-            // GROUP DATABASE
+            // GROUP DATABASE (sama seperti sebelumnya)
             if (m.isGroup) {
                 let chat = global.db.data.chats[m.chat];
                 if (typeof chat !== "object") global.db.data.chats[m.chat] = {};
@@ -183,7 +304,7 @@ export async function handler(chatUpdate) {
                 };
             }
         } catch (error) {
-            console.log(error);
+            console.log('[DB ERROR]', error);
         }
 
         if (typeof m.text !== "string") m.text = "";
@@ -194,16 +315,10 @@ export async function handler(chatUpdate) {
         let groupMetadata = {};
         if (m.isGroup) {
             try {
-                if (this.chats[m.chat]?.metadata) {
-                    groupMetadata = this.chats[m.chat].metadata;
-                } else {
-                    await delay(Math.floor(Math.random() * 1500) + 1500); // Delay random untuk hindari rate limit
-                    groupMetadata = await this.groupMetadata(m.chat).catch(() => ({}));
-                    if (!this.chats[m.chat]) this.chats[m.chat] = {};
-                    this.chats[m.chat].metadata = groupMetadata;
-                }
+                // Gunakan fungsi yang sudah dilindungi rate limit
+                groupMetadata = await getGroupMetadataWithCache(this, m.chat);
             } catch (e) {
-                console.log("Gagal fetch group metadata:", e);
+                console.log("[GROUP METADATA FETCH FAILED]", e);
                 groupMetadata = {};
             }
         }
@@ -278,75 +393,129 @@ export async function handler(chatUpdate) {
 
                 m.isCommand = true;
 
-                // SISTEM LIMIT YANG DIPERBAIKI
+                // SISTEM LIMIT BARU YANG LEBIH BAIK
                 let limitUsed = false;
                 let limitCost = 0;
-                let isPremiumActive = isPremium;
-
+                
                 if (plugin.limit) {
                     limitCost = typeof plugin.limit === "number" ? plugin.limit : 1;
-                    const user = global.db.data.users[m.sender];
+                    const userData = global.db.data.users[m.sender];
+                    
+                    // PREMIUM USER: Unlimited access
+                    if (isPremium) {
+                        limitUsed = false; // Tidak pakai limit
+                    } 
+                    // USER BIASA: Cek limit dengan sistem baru
+                    else {
+                        const hasEnoughLimit = limitSystem.useLimit(userData, limitCost);
+                        
+                        if (!hasEnoughLimit) {
+                            const remaining = userData.limit || 0;
+                            const resetTime = userData.lastLimitUpdate ? 
+                                new Date(userData.lastLimitUpdate).toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta' }) : 
+                                "00:00";
+                            
+                            await sendMessageWithProtection(this, m.chat, 
+`> *LIMIT HABIS!*
 
-                    // CEK APAKAH USER MEMILIKI LIMIT CUKUP
-                    if (!isPremiumActive) {
-                        // Untuk user biasa, cek limit
-                        if (user.limit < limitCost) {
-                            this.reply(m.chat, 
-`> *[ Warning ]* Limit kamu habis bro, tunggu reset limit ya
-Sisa limit: ${user.limit}
-*Reset otomatis tiap jam 00:00 WIB*`, m);
-                            continue; // BLOCK PENGGUNAAN FITUR
+Sisa limit kamu: *${remaining}*
+
+Limit akan bertambah otomatis tiap hari.
+Terakhir update: ${resetTime}
+
+*Fitur premium:* Limit tidak terbatas!`, 
+                            m);
+                            continue; // Block penggunaan fitur
                         }
                         limitUsed = true;
-                    } else {
-                        // Untuk premium user, limit tidak berkurang
-                        limitUsed = false;
                     }
                 }
 
-                let extra = { match, conn: this, usedPrefix, noPrefix, _args, args, command, text, participants, groupMetadata, user, bot, isROwner, isOwner, isRAdmin, isAdmin, isBotAdmin, isPremium, isBannned, isMuted, isRegister, isSewa, chatUpdate, __dirname, __filename };
+                let extra = { 
+                    match, 
+                    conn: this, 
+                    usedPrefix, 
+                    noPrefix, 
+                    _args, 
+                    args, 
+                    command, 
+                    text, 
+                    participants, 
+                    groupMetadata, 
+                    user, 
+                    bot, 
+                    isROwner, 
+                    isOwner, 
+                    isRAdmin, 
+                    isAdmin, 
+                    isBotAdmin, 
+                    isPremium, 
+                    isBannned, 
+                    isMuted, 
+                    isRegister, 
+                    isSewa, 
+                    chatUpdate, 
+                    __dirname, 
+                    __filename,
+                    sendMessageWithProtection // Tambah fungsi protected ke extra
+                };
 
                 try {
-                    // TAMBAH DELAY SEBELUM EKSEKUSI PLUGIN
-                    await delay(500);
+                    // Delay sebelum eksekusi untuk hindari rate limit
+                    await safeDelay(300 + Math.random() * 700);
+                    
+                    // Eksekusi plugin
                     await plugin.call(this, m, extra);
                 } catch (e) {
-                    console.log(e);
+                    console.log('[PLUGIN ERROR]', e);
                     const text = format(e);
                     if (e.name && decodedOwnLid[0]) {
                         let msg = `*『 ERROR MESSAGE 』*\n*PLUGIN:* ${m.plugin}\n*SENDER:* ${m.sender}\n*CHAT:* ${m.chat}\n*COMMAND:* ${usedPrefix + command}\n*ERROR:*\n${text}`;
-                        await sendMessageWithDelay(this, decodedOwnLid[0], msg);
+                        await sendMessageWithProtection(this, decodedOwnLid[0], msg);
                     }
                 } finally {
-                    // KURANGI LIMIT HANYA UNTUK USER BIASA
-                    if (plugin.limit && limitUsed && !isPremiumActive) {
-                        global.db.data.users[m.sender].limit -= limitCost;
-                        this.reply(m.chat, 
-`ʟɪᴍɪᴛ ʙᴇʀᴋᴜʀᴀɴɢ -${limitCost} | sɪsᴀ: ${global.db.data.users[m.sender].limit} ʟɪᴍɪᴛ
-ʜᴇᴍᴀʏ ʟɪᴍɪᴛ ʏᴀ ʙʀᴇ!`, m);
+                    // NOTIFIKASI LIMIT (hanya untuk user biasa)
+                    if (plugin.limit && limitUsed && !isPremium) {
+                        const currentLimit = global.db.data.users[m.sender].limit;
+                        await sendMessageWithProtection(this, m.chat, 
+`> *Command berhasil digunakan*
+Limit berkurang: *${limitCost}
+Sisa limit: *${currentLimit}
+Upgrade premium untuk limit tak terbatas!`, 
+                        m);
                     }
-
-                    // NOTIFIKASI UNTUK PREMIUM USER
-                    if (plugin.limit && isPremiumActive) {
-                        this.reply(m.chat, 
-`> ᴜsᴇʀ ᴘʀᴇᴍɪᴜᴍ`, m);
+                    
+                    // NOTIFIKASI PREMIUM USER
+                    if (plugin.limit && isPremium) {
+                        await sendMessageWithProtection(this, m.chat, 
+`> *PREMIUM USER ACCESS*
+Limit tidak berkurang - Unlimited access!`, 
+                        m);
                     }
 
                     if (typeof plugin.after === "function") {
-                        try { await plugin.after.call(this, m, extra); }
-                        catch (error) { console.log(error); }
+                        try { 
+                            await plugin.after.call(this, m, extra); 
+                        } catch (error) { 
+                            console.log('[PLUGIN AFTER ERROR]', error); 
+                        }
                     }
                 }
                 break;
             }
         }
     } catch (error) {
-        console.log(error);
+        console.log('[HANDLER ERROR]', error);
     } finally {
-        try { await printMessages(m, this); } catch (e) { console.log(e); }
+        try { 
+            await printMessages(m, this); 
+        } catch (e) { 
+            console.log('[PRINT MESSAGE ERROR]', e); 
+        }
     }
 }
 
+// Fungsi participantsUpdate dan groupsUpdate yang sudah dimodifikasi
 export async function participantsUpdate({ id, participants, action }) {
     try {
         if (this.isHandlerInit) return;
@@ -357,23 +526,18 @@ export async function participantsUpdate({ id, participants, action }) {
             case "add":
             case "remove":
                 if (chat?.sambutan) {
-                    await delay(2000); // Delay awal 2 detik
-                    let groupMetadata = (await this.groupMetadata(id).catch(() => ({}))) || (this.chats[id] || {})?.metadata || {};
+                    await safeDelay(3000); // Delay awal lebih lama
                     
-                    // Jika banyak peserta (>5), tambah delay lebih lama
-                    const delayTime = participants.length > 5 ? 3000 : 1500;
+                    // Gunakan fungsi protected untuk get metadata
+                    let groupMetadata = await getGroupMetadataWithCache(this, id);
+                    
+                    // Jika banyak peserta, delay lebih lama
+                    const baseDelay = participants.length > 3 ? 4000 : 2000;
                     
                     for (let user of participants) {
                         let lid = (user?.id || "").toString();
                         if (!lid || lid.endsWith("@g.us")) continue;
                         if (lid.endsWith("@s.whatsapp.net")) lid = await this.getLidPN?.(lid) || lid;
-
-                        let pp;
-                        try { 
-                            pp = { url: await this.profilePictureUrl(lid, "image") }; 
-                        } catch (e) { 
-                            pp = { url: await this.profilePictureUrl(id, "image").catch(() => "") }; 
-                        }
 
                         message = (action === "add"
                             ? (chat.sWelcome || this.sWelcome || "Selamat Datang @user")
@@ -383,21 +547,17 @@ export async function participantsUpdate({ id, participants, action }) {
                         ).replace("@user", "@" + lid.split("@")[0]);
 
                         try {
-                            await sendMessageWithDelay(this, id, { 
-                                image: pp, 
-                                caption: message, 
-                                contextInfo: { mentionedJid: [lid] }
-                            }, { quoted: null }, delayTime);
-                        } catch (e) {
-                            await sendMessageWithDelay(this, id, { 
+                            await sendMessageWithProtection(this, id, { 
                                 text: message, 
                                 contextInfo: { mentionedJid: [lid] }
-                            }, { quoted: null }, delayTime);
+                            }, {}, baseDelay);
+                        } catch (e) {
+                            console.log('[WELCOME/BYE ERROR]', e);
                         }
                         
-                        // Tambah delay tambahan jika banyak peserta
-                        if (participants.length > 3) {
-                            await delay(1000);
+                        // Extra delay untuk multiple participants
+                        if (participants.length > 1) {
+                            await safeDelay(1000);
                         }
                     }
                 }
@@ -416,10 +576,10 @@ export async function participantsUpdate({ id, participants, action }) {
                             : chat.sDemote || this.sDemote || "@user telah diberhentikan sebagai Admin"
                         ).replace("@user", "@" + lid.split("@")[0]);
 
-                        await sendMessageWithDelay(this, id, { 
+                        await sendMessageWithProtection(this, id, { 
                             text: message, 
                             contextInfo: { mentionedJid: [lid] }
-                        }, { quoted: null }, 2000);
+                        }, {}, 3000);
                     }
                 }
                 break;
@@ -432,12 +592,16 @@ export async function participantsUpdate({ id, participants, action }) {
 export async function groupsUpdate(groupsUpdate) {
     try {
         if (!groupsUpdate) return;
+        
         for (const groupUpdate of groupsUpdate) {
             const id = groupUpdate.id;
             if (!id) continue;
+            
             let text = "";
             const chat = global.db.data?.chats[id];
             if (!chat?.detect) continue;
+
+            await safeDelay(2000); // Delay sebelum proses
 
             if (groupUpdate?.author) {
                 let user = (groupUpdate?.author || "").toString();
@@ -448,11 +612,12 @@ export async function groupsUpdate(groupsUpdate) {
                 if (groupUpdate.inviteCode && user) text = "*Link group diganti oleh* @user".replace("@user", `@${user.split("@")[0]}`);
                 if (!text) continue;
                 
-                await sendMessageWithDelay(this, id, { text, mentions: [user] }, {}, 2000);
+                await sendMessageWithProtection(this, id, { text, mentions: [user] }, {}, 3000);
             }
+            
             if (groupUpdate.icon) {
-                await delay(1000);
-                await this.reply(id, "*Ikon group telah diganti*");
+                await safeDelay(3000);
+                await sendMessageWithProtection(this, id, "*Ikon group telah diganti*", {});
             }
         }
     } catch (e) {
@@ -478,7 +643,7 @@ global.dFail = (type, m, conn) => {
     if (msg) return conn.reply(m.chat, msg, m);
 };
 
-// FIX ERROR BIND + HOT RELOAD AMAN DI PTERODACTYL
+// HOT RELOAD
 let file = fileURLToPath(import.meta.url);
 watchFile(file, () => {
     unwatchFile(file);
