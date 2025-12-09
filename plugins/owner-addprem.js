@@ -22,22 +22,24 @@ let handler = async (m, { conn, usedPrefix, command, text }) => {
         who = m.sender
     }
 
+    // PASTIKAN USER ADA DI DATABASE
     if (!global.db.data.users[who]) {
-        global.db.data.users[who] = {
-            name: await conn.getName(who) || "Unknown",
-            limit: 10,
-            exp: 0,
-            level: 0,
-            register: false,
-            premium: false,
-            banned: false,
-            premiumTime: 0,
-            lastLimitUpdate: new Date().toISOString()
-        }
+        global.db.data.users[who] = {}
     }
-
+    
     let user = global.db.data.users[who]
-    let nama = await conn.getName(who)
+    let nama = await conn.getName(who) || "Unknown"
+    
+    // INISIALISASI JIKA FIELD TIDAK ADA
+    if (!user.name) user.name = nama
+    if (!user.limit) user.limit = 10
+    if (!user.exp) user.exp = 0
+    if (!user.level) user.level = 0
+    if (!user.register) user.register = false
+    if (user.premium === undefined) user.premium = false
+    if (!user.premiumTime) user.premiumTime = 0
+    if (!user.banned) user.banned = false
+    
     let isPremiumBefore = user.premium && user.premiumTime > Date.now()
     
     let sekarang = Date.now()
@@ -47,9 +49,24 @@ let handler = async (m, { conn, usedPrefix, command, text }) => {
         Math.max(user.premiumTime, sekarang) + tambahWaktu : 
         sekarang + tambahWaktu
 
+    // **UPDATE KE PREMIUM - HARUS SEMUA INI**
     user.premium = true
     user.premiumTime = premiumTimeBaru
-    user.limit = Infinity
+    user.limit = -1  // INI YANG PENTING!
+    
+    // **LOG DETAILED**
+    console.log('🎯 ADD PREMIUM DETAILED LOG:')
+    console.log('User:', who)
+    console.log('Name:', user.name)
+    console.log('Old limit:', user.limit)
+    console.log('Old premium:', user.premium)
+    console.log('Old premiumTime:', new Date(user.premiumTime).toLocaleString())
+    console.log('---')
+    console.log('New limit:', -1)
+    console.log('New premium:', true)
+    console.log('New premiumTime:', new Date(premiumTimeBaru).toLocaleString())
+    console.log('Premium active until:', new Date(premiumTimeBaru).toLocaleString())
+    console.log('===========================')
 
     let tanggalAktif = new Date(premiumTimeBaru).toLocaleDateString('id-ID', {
         weekday: 'long',
@@ -59,25 +76,35 @@ let handler = async (m, { conn, usedPrefix, command, text }) => {
     })
 
     let message = 
-`PREMIUM BERHASIL DITAMBAH
+`✅ PREMIUM BERHASIL DITAMBAH
 
 User : @${who.split('@')[0]}
 Nama : ${nama}
 Status : Premium User
 Durasi : ${hari} hari
 Berlaku sampai : ${tanggalAktif}
-Limit : Unlimited
+Limit : Unlimited (-1)
 
 ${isPremiumBefore ? 
 'Perpanjangan premium berhasil!' : 
 'Selamat! Sekarang kamu premium user!'}
 
-Nikmati fitur unlimited limit!`
+📝 Catatan: Limit telah di-set ke -1 (unlimited)`
 
     conn.sendMessage(m.chat, { 
         text: message, 
         mentions: [who] 
     }, { quoted: m })
+    
+    // **SAVE DATABASE**
+    if (global.db && typeof global.db.saveDatabase === 'function') {
+        try {
+            await global.db.saveDatabase()
+            console.log('✅ Database saved successfully')
+        } catch (e) {
+            console.error('❌ Error saving database:', e)
+        }
+    }
 }
 
 handler.help = ['addprem <hari> (@tag/reply/nomor)']
